@@ -1,87 +1,78 @@
-# Edge IIoT Gateway — Async OPC UA & UDP Telemetry Pipeline
+# Edge IIoT Gateway — Async Telemetry Pipeline
 
-Fault-tolerant async gateway that ingests industrial sensor data from OPC UA subscriptions and motorsport telemetry over UDP, normalises both streams into a single typed data model, and delivers to MQTT with SQLite-backed store-and-forward for at-least-once delivery.
+> Fault-tolerant async gateway that ingests industrial sensor data from OPC UA subscriptions and motorsport telemetry over UDP, normalises both into a single typed pipeline, and delivers to MQTT with SQLite-backed store-and-forward, differentiated QoS, and statistical anomaly detection — all running on a single Python asyncio event loop.
 
 ---
 
 ## Overview
 
-The gateway bridges two physically separate data sources — an OPC UA server exposing industrial process variables, and an Assetto Corsa shared-memory emitter sending vehicle telemetry over UDP — into a unified asyncio pipeline backed by MQTT, InfluxDB, and Grafana.
+The gateway addresses the core problem of an industrial edge node: getting data from heterogeneous sources into a time-series store reliably, without a managed broker, cloud infrastructure, or silent failure modes.
 
-All data entering the pipeline passes through a single Pydantic model (`SensorReading`) that enforces timezone-awareness, rejects NaN/Inf values, and validates the `value=None` / `quality=BAD` invariant at the point of ingestion, before the message ever touches the queue. The worker never needs to defend against corrupt data.
+Two sources feed a single `asyncio.Queue`:
 
-When MQTT is unavailable, undelivered messages are persisted to a local SQLite buffer and replayed FIFO on reconnection. Only after a successful `publish` is the record deleted — the system guarantees at-least-once delivery for signals marked `CRITICAL`, and explicitly discards `BEST_EFFORT` signals under broker outage to stay within the measured SQLite write ceiling.
+- **OPC UA** — event-driven subscriptions from an industrial protocol server, with `SourceTimestamp` preservation and `StatusCode → QualityStatus` translation
+- **UDP datagrams** — threshold-triggered telemetry from an Assetto Corsa shared-memory emitter, with per-signal range validation and lap event detection
 
-An in-process anomaly detector runs a sliding-window statistical analysis (mean ± k·σ) over configurable signals. Persistent exceedances — N consecutive samples outside the band — trigger an `AlertData` published to a dedicated MQTT topic and surfaced on `/alerts`. The gateway also exposes `/health` and `/metrics` over a stdlib-only HTTP server with no external dependencies.
+Both streams converge into a unified `SensorReading` Pydantic model validated at the ingestion boundary. The worker is source-agnostic. When MQTT is unavailable, `CRITICAL` signals persist to SQLite and replay FIFO on reconnection. `BEST_EFFORT` signals are explicitly discarded to stay within the measured write ceiling. An in-process anomaly detector runs sliding-window statistics per sensor; persistent exceedances publish alerts to a dedicated MQTT topic. Three HTTP endpoints (`/health`, `/metrics`, `/alerts`) expose internal state with no live I/O on the read path.
 
-The full stack (Mosquitto, InfluxDB, Telegraf, Grafana, OPC UA simulator, AC simulator, gateway) is containerised via Docker Compose and starts with a single command.
+This is an engineering exercise with measurable behaviour, explicit failure handling, and documented tradeoffs — not deployed infrastructure.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  SOURCES                                                                    │
-│                                                                             │
-│  OPC UA Server                          AC Shared Memory (Windows host)     │
-│    event-driven subscriptions             ~50 Hz polling, threshold-driven  │
-│    SourceTimestamp preserved              JSON over UDP :9000               │
-│         │                                         │                         │
-│  DataChangeHandler (sync)               ACProtocol.datagram_received (sync) │
-│    StatusCode → QualityStatus             SensorReading.from_ac_packet()    │
-│    node_id → sensor_id (sensors.yaml)     range validation per signal       │
-│    SensorReading.from_opc_notification()  LapEvent detection                │
-│         │  put_nowait()                           │  put_nowait()           │
-└─────────┼───────────────────────────────────────-─┼─────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│  SOURCES                                                                │
+│                                                                         │
+│  OPC UA Server (event-driven)          AC Simulator (UDP :9000)         │
+│    SourceTimestamp preserved             ~50 Hz polling, JSON datagrams │
+│    StatusCode → QualityStatus            per-signal range validation    │
+│    node_id → sensor_id (sensors.yaml)    LapEvent detection             │
+│    SensorReading.from_opc_notification() SensorReading.from_ac_packet() │
+│         │  put_nowait()                           │  put_nowait()       │
+└─────────┼───────────────────────────────────────-─┼─────────────────────┘
           └──────────────────┬──────────────────────┘
                              ▼
-                 asyncio.Queue (maxsize=2500)
-                   backpressure via put_nowait() + log
+               asyncio.Queue (maxsize=2500)
+                 overflow → discard + WARNING log
                              │
                              ▼
                           worker()
                              │
-                   ┌─────────┴──────────┐
-                   │  pending > 0?      │
-                   │  forward_pending() │◄── StoreAndForward (SQLite FIFO)
-                   │                    │      save_batch()  on send() = False
-                   └─────────┬──────────┘      delete_batch() after confirm
+               ┌─────────────┴───────────────┐
+               │  pending > 0?               │
+               │  forward_pending()  ◄──── StoreAndForward (SQLite FIFO)
+               └─────────────┬───────────────┘  save_batch()  on False
+                             │                  delete_batch() after confirm
+               queue.get(timeout=5s)
                              │
-                   queue.get(timeout=5s)
+               measure latency: received_at − timestamp
                              │
-                      measure latency
-                   received_at − timestamp
+               destination.send(payload)
                              │
-                   destination.send(payload)
+               ┌─────────────┴──────────────────┐
+               │  True                           │  False
+               │  metrics.cont_total++           │  CRITICAL  → SQLite
+               │  AnomalyDetector.analyze()      │  BEST_EFFORT → discard
+               │    sliding window mean ± k·σ    │
+               │    N consecutive → AlertData    │
+               │    → alert_destination.send()   │
+               └─────────────────────────────────┘
                              │
-                   ┌─────────┴─────────────┐
-                   │  True                 │  False
-                   │  metrics.cont_total++ │  CRITICAL → SQLite
-                   │                       │  BEST_EFFORT → discard + log
-                   │  anomaly_detector     │
-                   │  .analyze(reading)    │
-                   │  if alert:            │
-                   │    alert_destination  │
-                   │    .send(alert)       │
-                   └───────────────────────┘
+               MQTTDestination (aiomqtt, persistent)
+                 recreate client on MqttError
                              │
-                      MQTTDestination
-                        persistent connection (aiomqtt)
-                        recreate client on MqttError
+               Mosquitto broker
                              │
-                      Mosquitto broker
+               Telegraf  (timestamp: SensorReading.timestamp, not now())
                              │
-                      Telegraf (MQTT subscriber)
-                        timestamp: SensorReading.timestamp
+               InfluxDB 2.7
+                 measurement: sensor_readings
+                 tags:        sensor_id, quality, unit
+                 field:       value (float)
                              │
-                      InfluxDB 2.7
-                        measurement: sensor_readings
-                        tags: sensor_id, quality, unit
-                        field: value (float)
-                             │
-                      Grafana dashboard
-                        variable: $sensor_id (dynamic)
+               Grafana dashboard ($sensor_id variable)
 
 asyncio.TaskGroup (main.py)
   ├─ connect_with_retry()   OPC UA, exponential backoff 2s → 60s
@@ -90,47 +81,72 @@ asyncio.TaskGroup (main.py)
   └─ http_server()          /health  /metrics  /alerts  (stdlib only)
 ```
 
-### Data flow — normal operation
+---
 
-1. OPC UA `DataChangeHandler` or `ACProtocol` constructs a `SensorReading` and calls `queue.put_nowait()`. If the queue is full the datum is discarded with a WARNING log.
-2. `worker()` checks SQLite for any pending messages from a previous outage and replays them FIFO before consuming from the live queue.
-3. It calls `destination.send(payload)`. On success it increments counters and runs the anomaly detector. On failure it routes based on the signal's configured criticality.
-4. After `send()` returns, `AnomalyDetector.analyze()` updates the per-sensor sliding buffer and emits an `AlertData` to a separate MQTT topic if N consecutive samples breach the statistical threshold.
-5. Telegraf subscribes to `gateway/data`, stamps each message with `SensorReading.timestamp` (not `now()`), and writes to InfluxDB.
+## Key Engineering Features
 
-### Data flow — MQTT outage
+**Dual-source ingestion, source-agnostic worker**
+OPC UA `DataChangeHandler` and UDP `ACProtocol` are synchronous by contract. Both call `queue.put_nowait()` and construct `SensorReading` independently. The worker never inspects source identity — `opc_node_id=None` is semantic, not an error. Adding a third source requires only a new adapter.
 
-- `send()` returns `False`; `MQTTDestination` immediately attempts to recreate the client.
-- `CRITICAL` signals are persisted to SQLite via `save_batch()`.
-- `BEST_EFFORT` signals (configurable in `ac_signals.yaml`) are discarded.
-- On next worker cycle, `forward_pending()` replays SQLite rows FIFO. `delete_batch()` is called only after the broker confirms receipt.
+**Bounded queue with explicit backpressure**
+`asyncio.Queue(maxsize=2500)` with `put_nowait()` in all sync handlers. On overflow: discard + WARNING log. A logged drop is observable; a frozen event loop is not. No silent failures.
+
+**SQLite store-and-forward (at-least-once)**
+`delete_batch()` executes only after `destination.send()` returns `True`. A crash between a successful publish and the delete causes re-delivery on restart — at-least-once by design, never silent loss. `get_batch()` orders by `id ASC`; `forward_pending()` stops on the first failed send, preserving FIFO order during partial outage recovery.
+
+**Differentiated QoS — CRITICAL vs BEST_EFFORT**
+Per-signal `criticality` configured in `ac_signals.yaml`. On broker failure: `CRITICAL` signals (RPM, brake, throttle, gear, speed) → `save_batch()` to SQLite; `BEST_EFFORT` signals (tyre temps, wheel slip, accelerometers, suspension, fuel) → discard + log. OPC UA signals always follow the `CRITICAL` path. 21 AC signals are configured across both criticality tiers. The classification is the primary architectural mitigation — it reduces persistence volume before SQLite is ever stressed under high-frequency load.
+
+**Validation at the ingestion boundary**
+`SensorReading` rejects NaN, ±Inf, timezone-naive timestamps, and `value=None` with `quality≠BAD` at construction — before the message touches the queue. The worker operates under the invariant that any dequeued message has already passed the contract. NaN propagated to InfluxDB corrupts every window-function query that touches that interval.
+
+**Online anomaly detection**
+Per-sensor sliding window (configurable `window_size`, `k_factor`, `min_samples`) computes mean ± k·σ dynamically. Single-sample outliers are discarded; N consecutive samples outside the band emit an `AlertData` to `gateway/alerts` and surface on `/alerts`. Quality-BAD samples trigger a separate alert type.
+
+**Three-tier observability**
+`/health` classifies the system as `healthy` / `degraded` / `unhealthy` based on queue fill, MQTT state, and OPC UA connection. `/metrics` exposes p50/p95/p99 latency over a rolling 1,000-sample window. `/alerts` returns live anomaly state. All endpoints use `asyncio.start_server()` from stdlib; no framework. No live I/O on the read path.
+
+**OPC UA reconnection with exponential backoff**
+`connect_with_retry()` loops with configurable initial delay (2 s), factor (×2), and ceiling (60 s). `status_change_notification()` signals reconnection via `asyncio.Event`. `sensors.yaml` is reloaded on reconnect — configuration changes during downtime take effect automatically.
+
+**Graceful shutdown**
+Ingest tasks cancel first. `queue.join()` with 10 s timeout drains the live queue. On timeout, remaining items drain to SQLite manually. Worker cancels last.
 
 ---
 
-## Core Features
+## Design Decisions & Tradeoffs
 
-- **Dual-source ingestion:** OPC UA event-driven subscriptions and UDP datagrams unified into one typed pipeline; the worker is source-agnostic.
-- **Pydantic data contract:** `SensorReading` validates timezone-awareness, rejects NaN/Inf, enforces `value=None` only with `quality=BAD`, and maps OPC UA `StatusCode` to `QualityStatus`.
-- **SQLite store-and-forward:** at-least-once delivery for `CRITICAL` signals; FIFO replay on reconnection; `delete_batch()` called only after confirmed delivery.
-- **Differentiated QoS:** per-signal `criticality` flag (`CRITICAL` / `BEST_EFFORT`) in `ac_signals.yaml` controls SQLite persistence vs. discard under broker outage.
-- **Exponential backoff reconnection:** OPC UA reconnects with configurable initial delay, backoff factor, and ceiling (defaults: 2 s → 60 s, ×2).
-- **MQTT persistent connection:** `MQTTDestination` keeps one connection open; recreates the `aiomqtt.Client` on `MqttError` within the same `send()` call.
-- **Sliding-window anomaly detection:** per-sensor buffer, mean ± k·σ threshold, quality-BAD detection; alerts published to `gateway/alerts` topic only after N consecutive anomalous samples.
-- **Lap event detection:** `LapEvent` messages from the AC adapter are routed to a dedicated `gateway/laps` MQTT topic; treated as `BEST_EFFORT` (not persisted to SQLite).
-- **Bounded backpressure:** `asyncio.Queue(maxsize=2500)` with `put_nowait()` in all synchronous handlers; no blocking of the event loop under producer pressure.
-- **Latency measurement:** `received_at − timestamp` computed per message in the worker; accumulated in a fixed-length deque for p50/p95/p99 reporting in `/metrics`.
-- **HTTP observability:** `/health`, `/metrics`, `/alerts` served with `asyncio.start_server()`; no framework dependency.
-- **External YAML configuration:** sensor-to-node mapping (`sensors.yaml`), AC signal config (`ac_signals.yaml`), and anomaly analysis parameters (`analysis.yaml`) loaded at startup and on reconnection.
-- **Docker Compose stack:** Mosquitto, InfluxDB 2.7, Telegraf, Grafana, OPC UA simulator, AC simulator, and gateway; single-command startup.
-- **Integration test suite:** `MockDestination`-based pipeline tests covering happy path, validation rejection, SQLite fallback, and FIFO replay.
+**`put_nowait()` over `await queue.put()` in sync handlers**
+OPC UA callbacks and `DatagramProtocol` are synchronous by contract — they cannot `await`. Blocking the event loop until space is available would freeze all coroutines. The alternative is explicit data loss under sustained overload: a logged discard is observable; a frozen event loop is neither. This is the correct tradeoff for a real-time ingestion system.
+
+**Single worker, not a worker pool**
+Current load is ~95 msg/s against a measured worker ceiling of ~6,300–8,300 msg/s with a real broker — a margin of ~66–87×. A pool would add coordination overhead: shared SQLite access requires lock arbitration, counter increments need synchronisation, and FIFO ordering across workers requires explicit sequencing. None of that complexity is justified before hitting a bottleneck. Scale when the benchmark says to.
+
+**SQLite for store-and-forward, not Redis or Kafka**
+SQLite requires no additional process, no configuration, and is durable across restarts. `executemany` within a single transaction (PRAGMA WAL) amortises commit overhead to >150 k msg/s at batch size 500. The per-message commit figure (~442 msg/s) reflects the worst case of individual transactions — not the operational path. For the projected high-frequency scenario (~1,200 msg/s with MQTT down), batch throughput has sufficient headroom; the `BEST_EFFORT` classification reduces persistence volume further as the first line of defence. Redis would add a dependency and operational surface without solving a problem that exists at this scale; Kafka would be premature until horizontal partitioning is actually needed.
+
+**Drop on queue overflow, not block**
+The alternative to `put_nowait()` + discard in synchronous handlers is blocking the event loop — which would stall all in-flight coroutines including the worker, the HTTP server, and the OPC UA reconnect loop. Queue overflow at 2,500 in-flight messages already indicates a sustained MQTT or worker failure; adding producer backpressure at that point would amplify the failure, not mitigate it.
+
+**In-memory anomaly state, not persisted**
+Persisting per-sensor sliding windows adds write overhead and recovery complexity for a feature whose value is low-latency online detection, not historical completeness. After restart, detection resumes after `min_samples` new readings. Historical anomaly context already lives in InfluxDB via the raw series. The cold-start window is documented, not hidden.
+
+**MQTT QoS 1, not QoS 2**
+QoS 2 requires a 4-way handshake per message. At ~100 msg/s that is ~400 additional MQTT round-trips per second. The application layer already provides at-least-once semantics via `delete_batch()` post-confirm. InfluxDB deduplicates on `(measurement, tags, timestamp)`, so re-delivery of an identical point is harmless. QoS 2 overhead is real; the benefit is redundant.
+
+**No HTTP framework**
+Three read-only JSON endpoints do not justify an ASGI dependency. `asyncio.start_server()` from stdlib answers health checks in microseconds. HTTP/1.0-style connection closing is fine for low-frequency polling; it would be inappropriate for sustained query load, which is not a use case here.
+
+**Scalability limits**
+At current load (~95 msg/s), the architecture has ~66× headroom to the worker MQTT ceiling and ~5× headroom to the SQLite per-message ceiling. The documented stress scenario: 20 AC signals including high-frequency channels (wheel slip, accelerometer, suspension at ~60 Hz effective) under simultaneous MQTT outage yields ~1,200 msg/s ingress, exceeding the SQLite write ceiling. The `BEST_EFFORT` classification for those signals is the designed mitigation. A worker pool, Redis, or partitioned Kafka topic would be the next scaling levers — when the benchmark justifies it.
 
 ---
 
-## Data Model / Contracts
+## Data Model
 
 ### `SensorReading` (Pydantic)
 
-The canonical message that flows through every stage of the pipeline.
+The canonical message through every pipeline stage. Constructed at source; never mutated by the worker.
 
 | Field | Type | Constraint |
 |---|---|---|
@@ -140,21 +156,21 @@ The canonical message that flows through every stage of the pipeline.
 | `quality` | `QualityStatus` | enum: `Good`, `Bad`, `Uncertain` |
 | `unit` | `str` | non-empty |
 | `opc_node_id` | `str \| None` | `None` for UDP/AC sources — not an error field |
-| `received_at` | `datetime` | tz-aware; set by the gateway at ingestion |
-| `raw_value` | `float \| None` | mirrors `value`; reserved for future calibration |
+| `received_at` | `datetime` | tz-aware; set at gateway ingestion |
+| `raw_value` | `float \| None` | mirrors `value`; reserved seam for future per-sensor calibration transforms |
 
-**Invariants enforced by `model_validator`:**
+**Invariants (model_validator):**
 - `value=None` + `quality=Good` → `ValidationError`
 - `value=None` + `quality=Uncertain` → `ValidationError`
-- `value=None` + `quality=Bad` → accepted (OPC UA `Variant(Null)` on bad reads)
+- `value=None` + `quality=BAD` → accepted (OPC UA `Variant(Null)` on bad reads)
 
 **Semantic constructors:**
-- `SensorReading.from_opc_notification()` — translates `asyncua` native types; isolates the asyncua API surface.
-- `SensorReading.from_ac_packet()` — parses UDP JSON dict; applies per-signal range validation to set `quality`.
+- `from_opc_notification()` — translates asyncua native types; isolates the asyncua API surface from the rest of the pipeline
+- `from_ac_packet()` — parses UDP JSON dict; applies per-signal range bounds from `ac_signals.yaml` to set `quality`
 
 ### `LapEvent` (Pydantic)
 
-Discrete event emitted by the AC adapter when a lap completes.
+Discrete event emitted on AC lap completion. Routed to `gateway/laps` MQTT topic. Always `BEST_EFFORT` — not persisted to SQLite.
 
 | Field | Type |
 |---|---|
@@ -163,20 +179,16 @@ Discrete event emitted by the AC adapter when a lap completes.
 | `lap_time_ms` | `int` |
 | `timestamp` | `datetime` (tz-aware) |
 
-### MQTT payload (both models)
-
-`model.to_mqtt_payload()` calls `model_dump(mode='json')` — all fields serialised, timestamps as ISO-8601 strings.
-
 ### InfluxDB schema
 
 ```
 measurement: sensor_readings
 tags:         sensor_id, quality, unit
 fields:       value (float)
-timestamp:    SensorReading.timestamp
+timestamp:    SensorReading.timestamp  ← source timestamp, not ingestion time
 ```
 
-Tags are indexed; `sensor_id` queries are O(series). Timestamp comes from the source, not from Telegraf ingestion time, preserving the ability to compute pipeline latency from stored data.
+Tags are indexed; `sensor_id` queries are O(series). Timestamp comes from the source, preserving the ability to compute true pipeline latency from stored data.
 
 ### Alert payload (`gateway/alerts`)
 
@@ -197,44 +209,18 @@ Tags are indexed; `sensor_id` queries are O(series). Timestamp comes from the so
 
 ---
 
-## Reliability & Failure Handling
+## Reliability Model
 
-### Backpressure
-
-Both `DataChangeHandler` (OPC UA) and `ACProtocol` (UDP) are synchronous and cannot `await`. They call `queue.put_nowait()`. When the queue is at capacity (`maxsize=2500`) the datum is silently discarded with a `WARNING` log — the only alternative that does not block the event loop. The choice is explicit: a logged drop is observable; a frozen event loop is not.
-
-### MQTT reconnection
-
-`MQTTDestination` maintains a persistent `aiomqtt.Client`. On `MqttError` in `send()`, it immediately attempts to recreate and reconnect the client before returning `False`. The message that triggered the failure is not retried in the same cycle — it is either persisted to SQLite (if `CRITICAL`) or discarded (if `BEST_EFFORT`). The next message uses the restored connection.
-
-### Store-and-forward (SQLite)
-
-`StoreAndForward` uses a single persistent connection opened in `__init__`, protected by `asyncio.Lock` across all coroutines. `executemany` is used for batch inserts to reduce transaction overhead.
-
-**At-least-once guarantee:**
-- Messages are written to SQLite before `send()` is retried.
-- `delete_batch()` is called only after `destination.send()` returns `True` for each row.
-- If the process crashes between a successful `publish` and `delete_batch()`, the message will be replayed on restart. This is a known consequence of at-least-once semantics.
-
-**FIFO replay:** `get_batch()` orders by `id ASC`. `forward_pending()` iterates the batch sequentially and stops on the first failed send, so partial delivery during an ongoing outage does not reorder messages.
-
-### Differentiated QoS (CRITICAL / BEST_EFFORT)
-
-Each AC signal has a `criticality` field in `ac_signals.yaml`. The worker consults this after a failed `send()`:
-- `CRITICAL` → `store.save_batch([payload])`
-- `BEST_EFFORT` → discard + WARNING log
-
-OPC UA signals always follow the `CRITICAL` path (no `ac_signals` entry defaults to `CRITICAL`).
-
-**Known capacity limit:** `save_batch()` throughput is ~490 msg/s sustained in isolation. With 20 AC signals at high effective frequency under MQTT outage, ingress can exceed this rate. The `BEST_EFFORT` classification for high-frequency signals (e.g. wheel slip, suspension travel) is the architectural mitigation for this constraint.
-
-### OPC UA reconnection
-
-`connect_with_retry()` wraps the client in an exponential backoff loop (initial: 2 s, factor: ×2, ceiling: 60 s). When the subscription drops, `status_change_notification()` sets an `asyncio.Event` that the subscription loop monitors. On reconnection, `sensors.yaml` is reloaded — configuration changes during downtime take effect automatically.
-
-### Graceful shutdown
-
-`shutdown()` cancels ingest tasks (`t_ingesta`, `t_ac`, `t_http`) first, then calls `queue.join()` with a 10-second timeout to let the worker drain the live queue. On timeout, remaining queue items are manually drained to SQLite. The worker task is cancelled last.
+| Failure | Mechanism | Guarantee |
+|---|---|---|
+| Queue overflow | `put_nowait()` + WARNING log | Observable discard; event loop never blocked |
+| MQTT broker down | `save_batch()` on `send()` → False | At-least-once for CRITICAL; explicit discard for BEST_EFFORT |
+| MQTT reconnection | `MQTTDestination` recreates client on `MqttError` | First failure always persists or discards; subsequent messages use restored connection |
+| SQLite crash between send and delete | `delete_batch()` only after confirmed send | At-least-once: possible re-delivery, never silent loss |
+| OPC UA disconnection | Exponential backoff 2 s → 60 s via `asyncio.Event` | Subscriptions restored without manual intervention |
+| Data corruption at ingestion | Pydantic validators reject NaN, ±Inf, naive timestamps, `value=None` + `quality≠BAD` | Corrupt readings never enter the queue |
+| Process shutdown | `queue.join()` with 10 s timeout; overflow drained to SQLite | In-flight messages land in SQLite, not lost |
+| SQLite ceiling exceeded (high-freq MQTT outage) | BEST_EFFORT classification reduces persistence volume | No protection beyond QoS classification; documented, not hidden |
 
 ---
 
@@ -255,10 +241,10 @@ OPC UA signals always follow the `CRITICAL` path (no `ac_signals` entry defaults
 | Status | Condition |
 |---|---|
 | `healthy` | MQTT connected + OPC UA connected + queue < 75% of maxsize |
-| `degraded` | queue ≥ 75% of maxsize (≥ 1875 of 2500) |
+| `degraded` | queue ≥ 75% full (≥ 1,875 of 2,500) |
 | `unhealthy` | MQTT disconnected or OPC UA subscription dropped |
 
-`mqtt_connected` reflects `_connected`, a flag updated by `send()` — no live I/O on the health check path. `opc_ua_connected` reflects the `asyncio.Event` state.
+`mqtt_connected` is a cached flag updated by `send()` side effects — no live I/O on the health check path.
 
 ### `/metrics`
 
@@ -274,133 +260,91 @@ OPC UA signals always follow the `CRITICAL` path (no `ac_signals` entry defaults
 }
 ```
 
-Latency percentiles (p50/p95/p99) are computed over a rolling window of 1000 samples from a `collections.deque`. Percentiles are suppressed until at least 100 samples are accumulated.
-
-Latency is `received_at − timestamp`. For OPC UA, this is pipeline latency from `SourceTimestamp` to gateway ingestion. For AC UDP, it is UDP transit time plus the threshold-triggered emission delta.
+Latency percentiles computed over a rolling 1,000-sample `collections.deque`. Suppressed until ≥ 100 samples. Latency is `received_at − timestamp`: pipeline latency from `SourceTimestamp` for OPC UA; UDP transit + polling delta for AC.
 
 ### `/alerts`
 
-Returns the current set of active anomaly alerts as computed by `AnomalyDetector`. Historical alert data is not stored in the gateway — InfluxDB retains the raw series from which historical analysis can be reconstructed.
+Returns active anomaly alerts from in-memory `AnomalyDetector` state. Historical data is not stored in the gateway — InfluxDB retains the raw series for retrospective analysis.
 
-### Logging
+### Grafana + InfluxDB
 
-Structured log lines at DEBUG/INFO/WARNING/ERROR via Python `logging`. Notable events: queue full (WARNING), validation rejection (ERROR), forward start/completion (INFO), SQLite save/delete counts (INFO), latency per message (DEBUG).
+Telegraf subscribes to `gateway/data` and writes each message with `SensorReading.timestamp` (not `now()`), preserving source-time semantics. Grafana dashboards use a `$sensor_id` variable for dynamic filtering across sensors. The full monitoring stack starts automatically via Docker Compose.
 
 ---
 
 ## Tech Stack
 
-**Runtime**
-- Python 3.12 / asyncio
-- [asyncua](https://github.com/FreeOpcUa/opcua-asyncio) — async OPC UA client
-- [aiomqtt](https://github.com/sbtinstruments/aiomqtt) — async MQTT client
-- [Pydantic v2](https://docs.pydantic.dev/) — data validation and serialisation
-- SQLite (stdlib `sqlite3`) — store-and-forward buffer
-- python-dotenv — environment configuration
-
-**Infrastructure**
-- Eclipse Mosquitto 2 — MQTT broker
-- InfluxDB 2.7 — time-series storage
-- Telegraf 1.29 — MQTT → InfluxDB bridge
-- Grafana — dashboard and visualisation
-
-**Containerisation**
-- Docker / Docker Compose — full stack, single-command startup
-
-**Testing**
-- pytest + pytest-asyncio
-- `MockDestination` (in-process, no broker required) for pipeline integration tests
+| Component | Role |
+|---|---|
+| Python 3.12 / asyncio | Runtime, event loop, concurrency model |
+| asyncua | OPC UA client, subscription handler |
+| aiomqtt | Async MQTT client (persistent connection) |
+| Pydantic v2 | Data model, validation, serialisation |
+| SQLite (stdlib) | Store-and-forward buffer |
+| python-dotenv | Environment configuration |
+| Mosquitto | MQTT broker |
+| Telegraf | MQTT → InfluxDB bridge |
+| InfluxDB 2.7 | Time-series storage |
+| Grafana | Dashboard and visualisation |
+| Docker Compose | Reproducible full-stack startup |
+| pytest + pytest-asyncio | Unit and integration tests |
 
 ---
 
-## Project Structure
+## Performance & Benchmarks
 
-```
-.
-├── src/
-│   ├── main.py                # asyncio.TaskGroup entrypoint; shutdown logic
-│   ├── settings.py            # centralised configuration (env vars + .env)
-│   ├── models.py              # SensorReading, LapEvent, QualityStatus
-│   ├── opcua_client.py        # DataChangeHandler, subscribe(), connect_with_retry()
-│   ├── ac_adapter.py          # ACProtocol (UDP datagram endpoint), ac_adapter()
-│   ├── worker.py              # worker(), forward_pending()
-│   ├── store_forward.py       # StoreAndForward (SQLite, asyncio.Lock, FIFO)
-│   ├── anomaly_detector.py    # AnomalyDetector, AlertData
-│   ├── metrics.py             # GatewayMetrics (latency deque, health/snapshot)
-│   ├── server.py              # HTTP server: /health /metrics /alerts (stdlib)
-│   ├── config.py              # YAML loaders: sensors, ac_signals, analysis
-│   └── destinations/
-│       ├── base.py            # BaseDestination ABC
-│       └── mqtt_destination.py # MQTTDestination (aiomqtt, persistent connection)
-├── config/
-│   ├── sensors.yaml           # OPC UA node → sensor_id + unit mapping
-│   ├── ac_signals.yaml        # AC signal config: sensor_id, unit, range, criticality
-│   └── analysis.yaml          # Anomaly detector: window_size, min_samples, k_factor
-├── tests/
-│   ├── test_models.py         # Unit tests: Pydantic validation invariants (14 tests)
-│   ├── test_pipeline.py       # Integration tests: MockDestination-based E2E
-│   ├── benchmark_sqlite.py    # SQLite write throughput benchmark
-│   ├── benchmark_worker.py    # Worker throughput benchmark (MockDestination + MQTT)
-│   └── pytest.ini
-├── docker-compose.yml         # Full stack: broker, DB, telegraf, grafana, sims, gateway
-├── Dockerfile                 # Gateway image
-├── Dockerfile.sim             # OPC UA simulator image
-├── Dockerfile.ac_sim          # AC telemetry simulator image
-├── telegraf.conf              # MQTT input → InfluxDB output with timestamp passthrough
-├── mosquitto.conf
-└── requirements.txt
-```
+All measurements from local development hardware. Not representative of production or network environments.
 
----
-
-## Performance / Benchmarks
-
-Measured on development hardware. Numbers reflect isolated component throughput, not combined-load throughput.
-
-**Worker throughput (`benchmark_worker.py`, 10 000 pre-loaded messages)**
+**Worker throughput** (`benchmark_worker.py`, 10,000 pre-loaded messages):
 
 | Destination | Throughput |
 |---|---|
-| `MockDestination` (no I/O) | ~66 000 msg/s |
-| `MQTTDestination` (Docker broker) | ~8 300 msg/s |
+| `MockDestination` (pure in-memory, no I/O) | > 31,000 msg/s |
+| `MQTTDestination` (local Docker broker) | > 6,300 msg/s |
 
-Bottleneck with real MQTT: publish round-trip latency, not Python processing.
+Bottleneck with real MQTT: publish round-trip latency and socket I/O, not Python or asyncio processing. `MockDestination` is fully integrated in the benchmark, enabling CPU and anomaly detector throughput measurement without external infrastructure.
 
-**SQLite write throughput (`benchmark_sqlite.py`, `save_batch()` in isolation)**
+**SQLite write throughput** (`benchmark_sqlite.py`, `save_batch()` in isolation):
 
 | Batch size | Throughput |
 |---|---|
-| 1 (one INSERT per call) | ~few hundred msg/s |
-| 500 | higher |
-| 1 000 | ~490 msg/s sustained ceiling |
+| 1 (per-message commit, worst case) | ~442 msg/s |
+| 500 | ~156,000 msg/s |
+| 1,000 | ~232,000 msg/s |
 
-`executemany` within a single transaction is used for all batch writes. Throughput degrades under concurrent `forward_pending()` contention — the isolation benchmark represents an upper bound.
+`save_batch()` uses `executemany` within a single transaction (PRAGMA WAL) to amortise commit overhead. The previous ~490 msg/s ceiling was caused by individual per-message transactions saturating disk I/O — transactional batching eliminates that bottleneck. Under real combined load (worker + `forward_pending()` contention on the shared `asyncio.Lock`), throughput will be lower than the isolated figure.
 
-**Operational load (current configuration)**
+**Operational load vs. measured limits:**
 
-| Source | Typical rate |
+| Metric | Value |
 |---|---|
-| OPC UA (5 sensors, ~1 Hz) | ~5 msg/s |
-| AC UDP (6 signals, threshold-driven) | ~90 msg/s peak |
-| Combined | ~95 msg/s |
+| Current load (5 OPC UA + 21 AC signals) | ~95 msg/s |
+| Worker ceiling (MQTT) | > 6,300 msg/s |
+| SQLite effective ceiling (batch 500) | > 150,000 msg/s |
+| Margin to worker ceiling | ~66× |
+| Margin to SQLite ceiling | > 1,000× |
+| Projected stress scenario (21 AC signals, ~60 Hz effective) | ~1,200 msg/s |
 
-Current load is ~5× below the SQLite write ceiling and ~87× below the worker MQTT ceiling.
+At ~1,200 msg/s with MQTT down, SQLite batch throughput has sufficient headroom. The `BEST_EFFORT` QoS classification for high-frequency signals remains the first line of defence — it reduces persistence volume before SQLite is ever stressed.
 
 ---
 
 ## Known Limitations
 
-**SQLite throughput under high-frequency AC load.** If the full set of high-rate AC signals (wheel slip, accelerometer, suspension travel at ~60 Hz effective) is enabled and MQTT fails simultaneously, ingress can exceed ~490 msg/s. The `BEST_EFFORT` criticality classification for those signals is the current mitigation — they will be discarded rather than queued. There is no backpressure mechanism beyond this.
+**BEST_EFFORT signals are explicitly dropped under broker failure.**
+Tyre temps, wheel slip, accelerometers, suspension, and fuel (16 of 21 AC signals) are discarded when MQTT is unavailable. This is a design choice — `CRITICAL` signals (5) are persisted; `BEST_EFFORT` signals reduce SQLite write volume by design. With transactional batching, SQLite throughput is no longer the constraint; the classification remains correct for storage economics and signal priority, not as a capacity workaround.
 
-**AC timestamp accuracy.** `SensorReading.timestamp` for AC signals is set to `datetime.now(UTC)` at the Windows emitter at the time of shared-memory read, not the simulator's internal cycle timestamp. This introduces a polling jitter of up to one cycle (~20 ms at 50 Hz). OPC UA signals use `SourceTimestamp` from the server, which is more precise.
+**AC timestamp is gateway wall clock, not simulator cycle time.** `SensorReading.timestamp` for AC sources is `datetime.now(UTC)` at UDP datagram receipt, not the simulator's internal game clock. Latency measurement for AC reflects UDP transit + polling delta, not true sensor-to-gateway latency. OPC UA sources use `SourceTimestamp` from the server, which is precise.
 
-**Anomaly detector state is not persisted.** The per-sensor sliding buffer is in-process memory. If the gateway restarts, the buffer resets and the first `window_size` samples after restart will not produce statistical alerts.
+**Anomaly detector loses state on restart.** The per-sensor sliding window is in-process memory. After restart, detection resumes after `min_samples` new readings. The cold-start window is logged but not externally signalled.
 
-**MQTT reconnection loses one message.** The message that encounters a `MqttError` is not delivered in the same `send()` call — the client is recreated and the message is routed to SQLite (if `CRITICAL`) or discarded (if `BEST_EFFORT`). The next message uses the restored connection. This is by design for at-least-once semantics but introduces one-cycle latency on reconnection.
+**Health check uses last-known MQTT state, not a live probe.** `is_available()` returns a flag updated by `send()`. If the broker silently drops the connection without a `MqttError`, the health endpoint may report `healthy` until the next `send()` fails.
 
-**No authentication in the demo stack.** Mosquitto, InfluxDB, and the OPC UA simulator are configured without TLS or token auth for ease of local development. Not suitable for network-exposed deployments without additional hardening.
+**MQTT reconnection loses one message per disconnect.** The message that encounters a `MqttError` triggers client recreation but is not retried in the same cycle — it routes to SQLite or is discarded. The next message uses the restored connection. At-least-once is preserved for `CRITICAL` signals; one-cycle latency on reconnection is inherent.
 
-**`benchmark_worker.py` with `MQTTDestination` requires a live broker.** The benchmark numbers above for MQTT throughput are not reproducible without Docker infrastructure. `MockDestination` numbers are reproducible without any external dependencies.
+**No authentication in the demo stack.** Mosquitto, InfluxDB, and the OPC UA simulator are configured without TLS or token auth for local development ease. Not suitable for network-exposed deployments.
+
+**Single-node architecture.** One worker, one SQLite file, one MQTT connection. Horizontal scaling would require partitioning the queue, sharding SQLite or replacing it, and coordinating worker state — none of which is warranted at current load.
 
 ---
 
@@ -412,33 +356,33 @@ Current load is ~5× below the SQLite write ceiling and ~87× below the worker M
 git clone <repo-url>
 cd edge-iiot-gateway
 
-# Copy and configure environment
 cp .env.example .env
-# Edit .env: set INFLUXDB_TOKEN, INFLUXDB_PASSWORD, GRAFANA_PASSWORD
+# Edit .env: INFLUXDB_TOKEN, INFLUXDB_PASSWORD, GRAFANA_PASSWORD
 
-# Start the full stack
 docker compose up --build
-
-# Gateway health check (allow ~15s for startup)
-curl http://localhost:8080/health
-
-# Metrics
-curl http://localhost:8080/metrics
-
-# Active anomaly alerts
-curl http://localhost:8080/alerts
 ```
 
-Grafana is available at `http://localhost:3000` (default port; configurable via `GRAFANA_PORT` in `.env`).
+Allow ~15 seconds for full stack initialisation.
 
-**Running tests (no Docker required):**
+| Endpoint | Address |
+|---|---|
+| Gateway health | http://localhost:8080/health |
+| Gateway metrics | http://localhost:8080/metrics |
+| Gateway alerts | http://localhost:8080/alerts |
+| Grafana | http://localhost:3000 |
+| InfluxDB | http://localhost:8086 |
+| MQTT broker | localhost:1883 |
+
+**Run tests (no Docker required):**
 
 ```bash
 pip install -r requirements.txt
 pytest tests/test_models.py tests/test_pipeline.py -v
 ```
 
-**Running benchmarks:**
+Test coverage: 14 Pydantic validation cases + 9 pipeline integration tests (`MockDestination`) covering valid delivery, MQTT failure → SQLite persistence, FIFO replay order, CRITICAL vs BEST_EFFORT divergence, `LapEvent` routing, naive timestamp rejection, and `quality=BAD` + `value=None` acceptance.
+
+**Run benchmarks:**
 
 ```bash
 # SQLite throughput (no external dependencies)
@@ -446,18 +390,91 @@ python -m tests.benchmark_sqlite
 
 # Worker throughput with MockDestination (no external dependencies)
 python -m tests.benchmark_worker
+
+# Worker throughput with real MQTT (requires running broker)
+# Edit benchmark_worker.py: use_real_mqtt=True
+python -m tests.benchmark_worker
 ```
 
 ---
 
 ## Engineering Principles
 
-**Validation at the boundary.** `SensorReading` validates on construction, before the queue. The interior of the pipeline operates under the invariant that any message it handles has already passed the contract. NaN rejected at entry costs nothing; NaN propagated to InfluxDB corrupts every window-function query that touches that interval.
+**Validation at the boundary.** `SensorReading` validates at construction, before the queue. The pipeline interior operates under the invariant that any message it handles has passed the contract. The cost of validation at entry is negligible; the cost of NaN propagated to InfluxDB is corruption of every window-function query that touches that interval.
 
-**Source-agnostic worker.** The worker does not branch on `opc_node_id` or any source identifier. `opc_node_id=None` is a semantic signal (non-OPC UA source), not an error. A `LapEvent` in the queue is handled by type check, not by inspecting payload fields. Adding a third source requires only a new adapter that produces `SensorReading` objects — the worker is unchanged.
+**Source-agnostic worker.** The worker never branches on source identity. `opc_node_id=None` is semantic, not an error. `LapEvent` is handled by type check, not payload inspection. A third source requires only a new adapter producing `SensorReading` objects — the worker is unchanged.
 
-**No I/O on the health check path.** `is_available()` returns a cached `_connected` flag updated by `send()`. `opc_ua_connected` returns the state of an `asyncio.Event`. Health endpoints answer in microseconds without network calls.
+**Explicit over implicit failure handling.** Every failure mode at every stage has a documented outcome: queue full → discard + log; `send()` False + CRITICAL → SQLite; `send()` False + BEST_EFFORT → discard + log; OPC UA drop → backoff + reconnect; shutdown with queue items → drain to SQLite. No silent failures.
 
-**Scale when the benchmark says to.** The current architecture uses a single worker, a single SQLite file, and one MQTT connection. The worker handles ~8 300 msg/s with a real broker; current load is ~95 msg/s. No additional concurrency, message bus, or distributed buffer is warranted at this scale.
+**No I/O on the health check path.** `is_available()` returns a cached flag; `opc_ua_connected` reads an `asyncio.Event`. Health endpoints answer in microseconds without network calls.
 
-**Explicit over implicit failure handling.** Every failure mode at every stage has a documented outcome: queue full → discard + log; `send()` False + CRITICAL → SQLite; `send()` False + BEST_EFFORT → discard + log; OPC UA subscription drop → reconnect event + backoff; shutdown with queue items → drain to SQLite or manual persist on timeout. There are no silent failures.
+**Scale when the benchmark says to.** Single worker, single SQLite file, one MQTT connection. Current load is ~95 msg/s against a worker ceiling of >6,300 msg/s and a SQLite batch ceiling of >150,000 msg/s. The benchmark that would justify a pool, Redis, or Kafka does not yet exist.
+
+---
+
+## Project Structure
+
+```
+.
+├── src/
+│   ├── main.py                  # TaskGroup orchestration, shutdown logic
+│   ├── worker.py                # Core consumer loop, QoS routing, latency measurement
+│   ├── models.py                # SensorReading, LapEvent, QualityStatus (Pydantic)
+│   ├── store_forward.py         # SQLite persistence (save_batch, get_batch, delete_batch)
+│   ├── anomaly_detector.py      # Sliding window mean ± k·σ, persistent alert detection
+│   ├── opcua_client.py          # DataChangeHandler, connect_with_retry
+│   ├── ac_adapter.py            # UDP datagram endpoint, ACProtocol
+│   ├── metrics.py               # GatewayMetrics (counters, latency deque, health state)
+│   ├── server.py                # HTTP server: /health, /metrics, /alerts
+│   ├── settings.py              # Centralised config (env vars + .env + defaults)
+│   ├── config.py                # YAML loaders: sensors, ac_signals, analysis
+│   └── destinations/
+│       ├── base.py              # BaseDestination ABC
+│       └── mqtt_destination.py  # MQTTDestination with reconnection on MqttError
+├── config/
+│   ├── sensors.yaml             # OPC UA node → sensor_id + unit mapping
+│   ├── ac_signals.yaml          # AC signal → sensor_id, unit, range, criticality
+│   └── analysis.yaml            # Anomaly detector: window_size, k_factor, min_samples
+├── simulator/
+│   └── opcua_server.py          # Containerised OPC UA server with simulated sensor data
+├── tests/
+│   ├── test_models.py           # Unit tests: SensorReading validators (14 cases)
+│   ├── test_pipeline.py         # Integration tests: end-to-end pipeline (9 cases)
+│   ├── benchmark_worker.py      # Worker throughput benchmark
+│   └── benchmark_sqlite.py      # SQLite write throughput benchmark
+├── docker-compose.yml
+├── Dockerfile
+├── Dockerfile.sim
+├── Dockerfile.ac_sim
+├── telegraf.conf
+├── mosquitto.conf
+├── .env.example
+└── requirements.txt
+```
+
+---
+
+## Portfolio Notes
+
+### Demo
+
+<!-- Add GIF or screen recording of the running pipeline here -->
+<!-- Suggested: terminal split showing gateway logs + curl /metrics cycling -->
+<!-- Grafana dashboard screenshot showing live sensor_readings series -->
+
+> Video walkthrough: *(link to be added)* — covers architecture, failure injection (MQTT kill + recovery), and anomaly alert triggering.
+
+### Why This Project Matters
+
+IIoT edge nodes face a specific class of problem that differs from web backends: data arrives from protocols that predate async I/O (OPC UA, Modbus, CAN bus), quality metadata must travel with the value (not inferred later), and local persistence must bridge intermittent connectivity without a managed broker. This project works through those constraints concretely — backpressure without blocking a synchronous callback, at-least-once without a distributed log, QoS differentiation without a full message bus — and documents where each decision breaks down.
+
+### What I Would Scale Next
+
+| Current | Next lever | When |
+|---|---|---|
+| Single `asyncio.Queue` | Partitioned queues by criticality | Queue saturation on mixed high-frequency loads |
+| SQLite store-and-forward | Apache Kafka (or Redpanda) | Need replication, replay from arbitrary offset, or multi-consumer fan-out |
+| Single worker | Worker pool with shared `asyncio.Lock` on SQLite | Worker CPU becomes the bottleneck (not yet) |
+| In-memory anomaly state | Redis-backed sliding window | Multi-gateway deployment needing shared detection state |
+| Single-node gateway | Horizontal partitioning by `sensor_id` range | Throughput exceeds single-node MQTT or SQLite ceiling |
+| Per-message QoS classification | Dynamic criticality based on alert state | Adaptive persistence during active anomaly windows |

@@ -55,7 +55,9 @@ class DataChangeHandler:
                 meta["unit"],
             )
             self.queue.put_nowait(reading)
-            log.info("Encolado: %s = %s %s [%s]", meta["sensor_id"], val, meta["unit"], status_text)
+            log.debug(
+                "Encolado: %s = %s %s [%s]", meta["sensor_id"], val, meta["unit"], status_text
+            )
         except ValidationError as e:
             log.error("Dato inválido nodo %s: %s", node, e)
         except asyncio.QueueFull:

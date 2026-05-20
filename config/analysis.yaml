@@ -2,25 +2,25 @@ sensores:
 
   - sensor_id: planta1.maquina1.temperatura
     window_size: 60
-    k_factor: 2.0
+    k_factor: 3.0     
     min_samples: 30
-  
+
   - sensor_id: planta1.maquina1.presion
-    window_size: 90      
-    k_factor: 3.0        
+    window_size: 90
+    k_factor: 3.0
     min_samples: 30
 
   - sensor_id: planta1.maquina1.vibracion
-    window_size: 30      
-    k_factor: 1.0   
-    min_samples: 15
+    window_size: 30
+    k_factor: 2.5      
+    min_samples: 20    
 
   - sensor_id: planta1.maquina2.temperatura
     window_size: 60
-    k_factor: 2.5        
+    k_factor: 3.0      
     min_samples: 20
 
   - sensor_id: planta1.maquina2.velocidad
-    window_size: 20      
-    k_factor: 3.5        
+    window_size: 20
+    k_factor: 3.5
     min_samples: 10

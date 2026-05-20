@@ -34,7 +34,7 @@ class ACProtocol(asyncio.DatagramProtocol):
                 return
 
             reading = SensorReading.from_ac_packet(packet, signal_config)
-            log.info("SensorReading creado: %s quality=%s", reading.sensor_id, reading.quality)
+            log.debug("SensorReading creado: %s quality=%s", reading.sensor_id, reading.quality)
             self._queue.put_nowait(reading)
 
         except ValidationError as e:

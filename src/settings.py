@@ -81,13 +81,14 @@ class Settings:
 
     # ── Worker ───────────────────────────────────────────────────────────────
     WORKER_QUEUE_TIMEOUT_S: float = 5.0
+    WORKER_BATCH_SIZE: int = 10000
 
     # ── Shutdown ─────────────────────────────────────────────────────────────
     SHUTDOWN_DRAIN_TIMEOUT_S: float = 10.0
 
     # ── SQLite Store & Forward ───────────────────────────────────────────────
     DB_PATH: str = _get("DB_PATH", "buffer.db")
-    DB_BATCH_SIZE: int = 100
+    DB_BATCH_SIZE: int = 500
 
     # ── Métricas / Latencia ──────────────────────────────────────────────────
     LATENCY_WINDOW_SIZE: int = 1000  # maxlen del deque de latencias

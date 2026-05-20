@@ -1,0 +1,126 @@
+signals:
+  - signal: rpms
+    sensor_id: ac.car.rpms
+    unit: rpm
+    criticality: CRITICAL
+    range: [0, 10000]
+
+  - signal: brake
+    sensor_id: ac.car.brake
+    unit: ratio
+    criticality: CRITICAL
+    range: [0, 1]
+
+  - signal: throttle
+    sensor_id: ac.car.throttle
+    unit: ratio
+    criticality: CRITICAL
+    range: [0, 1]
+
+  - signal: gear
+    sensor_id: ac.car.gear
+    unit: ""
+    criticality: CRITICAL
+    range: [-1, 7]
+
+  - signal: speed_kmh
+    sensor_id: ac.car.speed_kmh
+    unit: km/h
+    criticality: CRITICAL
+    range: [0, 300]
+
+  - signal: tyre_temp_fl
+    sensor_id: ac.car.tyre_temp_fl
+    unit: °C
+    criticality: BEST_EFFORT
+    range: [0, 200]
+
+  - signal: tyre_temp_fr
+    sensor_id: ac.car.tyre_temp_fr
+    unit: °C
+    criticality: BEST_EFFORT
+    range: [0, 200]
+
+  - signal: tyre_temp_rl
+    sensor_id: ac.car.tyre_temp_rl
+    unit: °C
+    criticality: BEST_EFFORT
+    range: [0, 200]
+
+  - signal: tyre_temp_rr
+    sensor_id: ac.car.tyre_temp_rr
+    unit: °C
+    criticality: BEST_EFFORT
+    range: [0, 200]
+
+  - signal: wheel_slip_fl
+    sensor_id: ac.car.wheel_slip_fl
+    unit: ratio
+    criticality: BEST_EFFORT
+    range: [-1.5, 1.5]
+
+  - signal: wheel_slip_fr
+    sensor_id: ac.car.wheel_slip_fr
+    unit: ratio
+    criticality: BEST_EFFORT
+    range: [-1.5, 1.5]
+
+  - signal: wheel_slip_rl
+    sensor_id: ac.car.wheel_slip_rl
+    unit: ratio
+    criticality: BEST_EFFORT
+    range: [-1.5, 1.5]
+
+  - signal: wheel_slip_rr
+    sensor_id: ac.car.wheel_slip_rr
+    unit: ratio
+    criticality: BEST_EFFORT
+    range: [-1.5, 1.5]
+
+  - signal: acc_g_x
+    sensor_id: ac.car.acc_g_x
+    unit: g
+    criticality: BEST_EFFORT
+    range: [-6.0, 6.0]
+
+  - signal: acc_g_y
+    sensor_id: ac.car.acc_g_y
+    unit: g
+    criticality: BEST_EFFORT
+    range: [-6.0, 6.0]
+
+  - signal: acc_g_z
+    sensor_id: ac.car.acc_g_z
+    unit: g
+    criticality: BEST_EFFORT
+    range: [-6.0, 6.0]
+
+  - signal: suspension_fl
+    sensor_id: ac.car.suspension_fl
+    unit: m
+    criticality: BEST_EFFORT
+    range: [0, 0.3]
+
+  - signal: suspension_fr
+    sensor_id: ac.car.suspension_fr
+    unit: m
+    criticality: BEST_EFFORT
+    range: [0, 0.3]
+
+  - signal: suspension_rl
+    sensor_id: ac.car.suspension_rl
+    unit: m
+    criticality: BEST_EFFORT
+    range: [0, 0.3]
+
+  - signal: suspension_rr
+    sensor_id: ac.car.suspension_rr
+    unit: m
+    criticality: BEST_EFFORT
+    range: [0, 0.3]
+    
+  - signal: fuel
+    sensor_id: ac.car.fuel
+    unit: kg
+    criticality: BEST_EFFORT
+    range: [0, 120]

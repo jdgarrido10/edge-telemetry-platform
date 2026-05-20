@@ -1,0 +1,95 @@
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    restart: always
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf
+      - ./mosquitto_data:/mosquitto/data
+
+  influxdb:
+    image: influxdb:2.7
+    restart: always
+    ports:
+      - "8086:8086"
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=${INFLUXDB_USERNAME}
+      - DOCKER_INFLUXDB_INIT_PASSWORD=${INFLUXDB_PASSWORD}
+      - DOCKER_INFLUXDB_INIT_ORG=${INFLUXDB_ORG}
+      - DOCKER_INFLUXDB_INIT_BUCKET=${INFLUXDB_BUCKET}
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=${INFLUXDB_TOKEN}
+    volumes:
+      - ./influx_data:/var/lib/influxdb2
+
+  telegraf:
+    image: telegraf:1.29
+    restart: always
+    environment:
+      - INFLUX_TOKEN=${INFLUXDB_TOKEN}
+    depends_on:
+      - mosquitto
+      - influxdb
+    volumes:
+      - ./telegraf.conf:/etc/telegraf/telegraf.conf
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: always
+    ports:
+      - "${GRAFANA_PORT}:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+    depends_on:
+      - influxdb
+    volumes:
+      - ./grafana_data:/var/lib/grafana
+
+  opc-ua-sim:
+    build:
+      context: .
+      dockerfile: Dockerfile.sim
+    container_name: opc-ua-sim
+    volumes:
+      - ./config/sensors.yaml:/app/config/sensors.yaml
+      - ./config/sim_sensors.yaml:/app/config/sim_sensors.yaml
+    ports:
+      - "${OPC_UA_PORT}:4840"
+    restart: always
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: iot-gateway
+    depends_on:
+      - mosquitto
+      - opc-ua-sim
+    volumes:
+      - ./config/sensors.yaml:/app/config/sensors.yaml
+      - ./config/ac_signals.yaml:/app/config/ac_signals.yaml
+      - ./config/analysis.yaml:/app/config/analysis.yaml
+    env_file:
+      - .env
+    ports:
+      - "${HTTP_PORT}:8080"
+      - "${AC_UDP_PORT}:9000/udp"
+    restart: always
+   
+  ac-sim:
+    build:
+      context: .
+      dockerfile: Dockerfile.ac_sim
+    container_name: ac-sim
+    depends_on:
+      - gateway
+    environment:
+      - GATEWAY_HOST=gateway
+      - GATEWAY_PORT=${AC_UDP_PORT:-9000}
+      - SIM_HZ=50
+      - SIM_LAPS=0
+      - LOG_LEVEL=INFO
+    restart: unless-stopped
+ 

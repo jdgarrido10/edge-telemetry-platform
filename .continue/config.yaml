@@ -1,0 +1,46 @@
+name: Local Config
+version: 1.0.0
+schema: v1
+
+models:
+  - name: Qwen Coder 7B (Principal)
+    provider: ollama
+    model: qwen2.5-coder:7b
+    apiBase: http://localhost:11434
+    roles:
+      - chat
+      - edit
+      - apply
+
+  - name: Llama 3.1 8B
+    provider: ollama
+    model: llama3.1:8b
+    apiBase: http://localhost:11434
+    roles:
+      - chat
+      - edit
+
+  - name: DeepSeek R1 14B
+    provider: ollama
+    model: deepseek-r1:14b
+    apiBase: http://localhost:11434
+    roles:
+      - chat
+
+  - name: Nomic Embed
+    provider: ollama
+    model: nomic-embed-text:latest
+    apiBase: http://localhost:11434
+    roles:
+      - embed
+
+tabAutocompleteModel:
+  name: Qwen Coder 3B (Autocompletado)
+  provider: ollama
+  model: qwen2.5-coder:3b
+  apiBase: http://localhost:11434
+
+embeddingsProvider:
+  provider: ollama
+  model: nomic-embed-text
+  apiBase: http://localhost:11434

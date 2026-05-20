@@ -1,0 +1,29 @@
+sensores:
+
+  - maquina: Maquina1
+    variable: Temperatura
+    sensor_id: planta1.maquina1.temperatura
+    unit: ºC
+    
+  - maquina: Maquina1
+    variable: Presion
+    sensor_id: planta1.maquina1.presion
+    unit: bar
+    
+  - maquina: Maquina1
+    variable: Vibracion
+    sensor_id: planta1.maquina1.vibracion
+    unit: mm/s
+   
+
+  - maquina: Maquina2
+    variable: Temperatura
+    sensor_id: planta1.maquina2.temperatura
+    unit: ºC
+    
+  - maquina: Maquina2
+    variable: Velocidad
+    sensor_id: planta1.maquina2.velocidad
+    unit: rpm
+   
+

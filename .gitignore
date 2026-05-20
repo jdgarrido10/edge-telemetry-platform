@@ -1,0 +1,52 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+.Python
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing & linting
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Python version pin (local tooling only)
+.python-version
+
+# SQLite store-and-forward buffer
+*.db
+*.sqlite
+*.sqlite3
+
+# Docker volume data (mounted locally)
+grafana_data/
+influx_data/
+mosquitto_data/
+
+# Logs
+*.log
+logs/
+
+# macOS / Windows
+.DS_Store
+Thumbs.db

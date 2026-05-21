@@ -161,7 +161,7 @@ QoS 2 requires a 4-way handshake per message. At ~451 msg/s that is ~1,800 addit
 Three read-only JSON endpoints do not justify an ASGI dependency. `asyncio.start_server()` from stdlib answers health checks in microseconds. HTTP/1.0-style connection closing is fine for low-frequency polling; it would be inappropriate for sustained query load, which is not a use case here.
 
 **Scalability limits**
-At current load (~451 msg/s), the architecture has ~14× headroom to the worker MQTT ceiling and ~5× headroom to the SQLite per-message ceiling. The documented stress scenario: 21 AC signals including high-frequency channels (wheel slip, accelerometer, suspension at ~60 Hz effective) under simultaneous MQTT outage yields ~1,200 msg/s ingress — well within the SQLite batch ceiling (>163,000 msg/s), but persistence volume grows rapidly. The `BEST_EFFORT` classification for those signals is the designed mitigation: it reduces what reaches SQLite before the write path is ever stressed. A worker pool, Redis, or partitioned Kafka topic would be the next scaling levers — when the benchmark justifies it.
+At current load (~451 msg/s), the architecture has ~14× headroom to the worker MQTT ceiling. The per-message SQLite mode (~447 msg/s) is effectively saturated at current load — batched writes (batch 500: >163,000 msg/s, ~362× headroom) are what make the write path viable. The documented stress scenario — 21 AC signals under simultaneous MQTT outage — yields ~1,050 msg/s ingress, well within the SQLite batch ceiling, though real contention on the shared asyncio.Lock will reduce that figure below the isolated benchmark.
 
 
 ---

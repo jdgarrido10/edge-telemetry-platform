@@ -18,6 +18,7 @@ Both streams converge into a unified `SensorReading` Pydantic model validated at
 This is an engineering exercise with measurable behaviour, explicit failure handling, and documented tradeoffs — not deployed infrastructure.
 
 ---
+
 <video src="https://github.com/user-attachments/assets/9c854a3e-e39f-4efd-8d13-a763b0de1002" width="900" autoplay loop muted playsinline></video>
 
 ---

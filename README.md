@@ -74,7 +74,7 @@ This is an engineering exercise with measurable behaviour, explicit failure hand
                              │
                destination.send(payload)
                              │
-               ┌─────────────┴──────────────────┐
+               ┌─────────────┴───────────────────┐
                │  True                           │  False
                │  metrics.cont_total++           │  CRITICAL  → SQLite
                │  AnomalyDetector.analyze()      │  BEST_EFFORT → discard

@@ -22,6 +22,25 @@ This is an engineering exercise with measurable behaviour, explicit failure hand
 
 ---
 
+## Table of Contents
+
+- [Architecture](#architecture)
+- [Key Engineering Features](#key-engineering-features)
+- [Design Decisions & Tradeoffs](#design-decisions--tradeoffs)
+- [Data Model](#data-model)
+- [Reliability Model](#reliability-model)
+- [Observability](#observability)
+- [Tech Stack](#tech-stack)
+- [Performance & Benchmarks](#performance--benchmarks)
+- [Known Limitations](#known-limitations)
+- [Demos](#demos)
+- [Quick Start](#quick-start)
+- [Engineering Principles](#engineering-principles)
+- [Project Structure](#project-structure)
+- [Portfolio Notes](#portfolio-notes)
+
+---
+
 ## Architecture
 
 ```

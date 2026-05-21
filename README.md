@@ -18,7 +18,7 @@ Both streams converge into a unified `SensorReading` Pydantic model validated at
 This is an engineering exercise with measurable behaviour, explicit failure handling, and documented tradeoffs — not deployed infrastructure.
 
 ---
-<video src="docs/assets/dashboard_opcua_preview.mp4" width="900" autoplay loop muted playsinline></video>
+<video src="https://github.com/jdgarrido10/edge-telemetry-platform/issues/3#issue-4496850945" width="900" autoplay loop muted playsinline></video>
 
 ---
 
@@ -359,25 +359,25 @@ Tyre temps, wheel slip, accelerometers, suspension, and fuel (16 of 21 AC signal
 
 ### Industrial Dashboard (OPC UA)
 
-<video src="docs/assets/dashboard_opcua.mp4" width="900" autoplay loop muted playsinline></video>
+<video src="https://github.com/jdgarrido10/edge-telemetry-platform/issues/2#issue-4496849584" width="900" autoplay loop muted playsinline></video>
 
 Grafana dashboard showing 5 OPC UA signals in real time: temperature, pressure, vibration, flow and humidity. The grey band represents mean ± k·σ from the anomaly detector's sliding window. Red bars are alerts published to `gateway/alerts` on consecutive threshold exceedances. The final sequence shows a sensor transitioning to BAD quality state and the gateway detecting it automatically.
 
 ### Motorsport Dashboard (Assetto Corsa)
-<video src="docs/assets/dashboard_ac.mp4" width="1000" autoplay loop muted playsinline></video>
+<video src="https://github.com/jdgarrido10/edge-telemetry-platform/issues/1#issue-4496848358" width="1000" autoplay loop muted playsinline></video>
 
 Grafana dashboard showing 21 telemetry signals from a Porsche 911 GT3 RS (991 gen) at Spa-Francorchamps: RPM, throttle, brake, speed, gear and steering among others. CRITICAL signals (RPM, brake, throttle, gear, speed) are persisted to SQLite during broker outages and recovered automatically on reconnection.
 
 ### Live Failover — MQTT Broker
 <div align="center">
-<video src="docs/assets/failover_broker.mp4" width="600" autoplay loop muted playsinline></video>
+<video src="https://github.com/jdgarrido10/edge-telemetry-platform/issues/4#issue-4496851981" width="600" autoplay loop muted playsinline></video>
 </div>
 
 26-second broker outage triggered by `test_broker_failover.sh`. During the outage `status` switches to `unhealthy`, `queue` grows as messages buffer in memory and `pending` accumulates in SQLite. On reconnection the broker drains to `queue=0`, `pending=0` and `status` returns to `healthy` in 1s. Full cycle visible in a single run.
 
 ### Live Failover — OPC UA
 <div align="center">
-<video src="docs/assets/failover_opcua.mp4" width="600" autoplay loop muted playsinline></video>
+<video src="https://github.com/jdgarrido10/edge-telemetry-platform/issues/5#issue-4496853164" width="600" autoplay loop muted playsinline></video>
 </div>
 
 46-second OPC UA simulator outage triggered by `test_opcua_failover.sh`. `opcua=false` during the entire outage while MQTT remains healthy. Recovery via exponential backoff — `opcua=true` restored automatically in 11s without manual intervention. Final state shows all signals healthy and queue drained.

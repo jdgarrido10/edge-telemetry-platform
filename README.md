@@ -361,7 +361,7 @@ Tyre temps, wheel slip, accelerometers, suspension, and fuel (16 of 21 AC signal
 
 <video src="https://github.com/user-attachments/assets/4cc1ae41-854e-4e3c-b3f7-313c726be49e" width="900" autoplay loop muted playsinline></video>
 
-Grafana dashboard showing 5 OPC UA signals in real time: temperature, pressure, vibration, flow and humidity. The grey band represents mean ± k·σ from the anomaly detector's sliding window. Red bars are alerts published to `gateway/alerts` on consecutive threshold exceedances. The final sequence shows a sensor transitioning to BAD quality state and the gateway detecting it automatically.
+Grafana dashboard showing 5 OPC UA signals in real time: temperature, pressure, vibration, flow and humidity. The green band represents the live sensor value time series. Red bars are alerts published to `gateway/alerts` on consecutive threshold exceedances. The final sequence shows a sensor transitioning to BAD quality state and the gateway detecting it automatically.
 
 ### Motorsport Dashboard (Assetto Corsa)
 <video src="https://github.com/user-attachments/assets/ec295abf-a2f5-4650-b787-455d72fb18a3" width="1000" autoplay loop muted playsinline></video>

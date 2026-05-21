@@ -13,9 +13,12 @@ Two sources feed a single `asyncio.Queue`:
 - **OPC UA** — event-driven subscriptions from an industrial protocol server, with `SourceTimestamp` preservation and `StatusCode → QualityStatus` translation
 - **UDP datagrams** — threshold-triggered telemetry from an Assetto Corsa shared-memory emitter, with per-signal range validation and lap event detection
 
-Both streams converge into a unified `SensorReading` Pydantic model validated at the ingestion boundary. The worker is source-agnostic. When MQTT is unavailable, `CRITICAL` signals persist to SQLite and replay FIFO on reconnection. `BEST_EFFORT` signals are explicitly discarded to stay within the measured write ceiling. An in-process anomaly detector runs sliding-window statistics per sensor; persistent exceedances publish alerts to a dedicated MQTT topic. Three HTTP endpoints (`/health`, `/metrics`, `/alerts`) expose internal state with no live I/O on the read path.
+Both streams converge into a unified `SensorReading` Pydantic model validated at the ingestion boundary. The worker is source-agnostic. When MQTT is unavailable, `CRITICAL` signals persist to SQLite and replay FIFO on reconnection. `BEST_EFFORT` signals are explicitly discarded by design — persistence is reserved for CRITICAL signals. An in-process anomaly detector runs sliding-window statistics per sensor; persistent exceedances publish alerts to a dedicated MQTT topic. Three HTTP endpoints (`/health`, `/metrics`, `/alerts`) expose internal state with no live I/O on the read path.
 
 This is an engineering exercise with measurable behaviour, explicit failure handling, and documented tradeoffs — not deployed infrastructure.
+
+---
+<video src="docs/assets/dashboard_opcua_preview.mp4" width="900" autoplay loop muted playsinline></video>
 
 ---
 
@@ -34,7 +37,7 @@ This is an engineering exercise with measurable behaviour, explicit failure hand
 └─────────┼───────────────────────────────────────-─┼─────────────────────┘
           └──────────────────┬──────────────────────┘
                              ▼
-               asyncio.Queue (maxsize=2500)
+               asyncio.Queue (maxsize=10000)
                  overflow → discard + WARNING log
                              │
                              ▼
@@ -89,7 +92,7 @@ asyncio.TaskGroup (main.py)
 OPC UA `DataChangeHandler` and UDP `ACProtocol` are synchronous by contract. Both call `queue.put_nowait()` and construct `SensorReading` independently. The worker never inspects source identity — `opc_node_id=None` is semantic, not an error. Adding a third source requires only a new adapter.
 
 **Bounded queue with explicit backpressure**
-`asyncio.Queue(maxsize=2500)` with `put_nowait()` in all sync handlers. On overflow: discard + WARNING log. A logged drop is observable; a frozen event loop is not. No silent failures.
+`asyncio.Queue(maxsize=10000)` with `put_nowait()` in all sync handlers. On overflow: discard + WARNING log. A logged drop is observable; a frozen event loop is not. No silent failures.
 
 **SQLite store-and-forward (at-least-once)**
 `delete_batch()` executes only after `destination.send()` returns `True`. A crash between a successful publish and the delete causes re-delivery on restart — at-least-once by design, never silent loss. `get_batch()` orders by `id ASC`; `forward_pending()` stops on the first failed send, preserving FIFO order during partial outage recovery.
@@ -120,25 +123,26 @@ Ingest tasks cancel first. `queue.join()` with 10 s timeout drains the live queu
 OPC UA callbacks and `DatagramProtocol` are synchronous by contract — they cannot `await`. Blocking the event loop until space is available would freeze all coroutines. The alternative is explicit data loss under sustained overload: a logged discard is observable; a frozen event loop is neither. This is the correct tradeoff for a real-time ingestion system.
 
 **Single worker, not a worker pool**
-Current load is ~95 msg/s against a measured worker ceiling of ~6,300–8,300 msg/s with a real broker — a margin of ~66–87×. A pool would add coordination overhead: shared SQLite access requires lock arbitration, counter increments need synchronisation, and FIFO ordering across workers requires explicit sequencing. None of that complexity is justified before hitting a bottleneck. Scale when the benchmark says to.
+Current load is ~451 msg/s against a measured worker ceiling of ~6,300–8,300 msg/s with a real broker — a margin of ~14×. A pool would add coordination overhead: shared SQLite access requires lock arbitration, counter increments need synchronisation, and FIFO ordering across workers requires explicit sequencing. None of that complexity is justified before hitting a bottleneck. Scale when the benchmark says to.
 
 **SQLite for store-and-forward, not Redis or Kafka**
-SQLite requires no additional process, no configuration, and is durable across restarts. `executemany` within a single transaction (PRAGMA WAL) amortises commit overhead to >150 k msg/s at batch size 500. The per-message commit figure (~442 msg/s) reflects the worst case of individual transactions — not the operational path. For the projected high-frequency scenario (~1,200 msg/s with MQTT down), batch throughput has sufficient headroom; the `BEST_EFFORT` classification reduces persistence volume further as the first line of defence. Redis would add a dependency and operational surface without solving a problem that exists at this scale; Kafka would be premature until horizontal partitioning is actually needed.
+SQLite requires no additional process, no configuration, and is durable across restarts. `executemany` within a single transaction (PRAGMA WAL) amortises commit overhead to >163,000 msg/s at batch size 500. The per-message commit figure (~442 msg/s) reflects the worst case of individual transactions — not the operational path. For the projected high-frequency scenario (~1,200 msg/s with MQTT down), batch throughput has sufficient headroom; the `BEST_EFFORT` classification reduces persistence volume further as the first line of defence. Redis would add a dependency and operational surface without solving a problem that exists at this scale; Kafka would be premature until horizontal partitioning is actually needed.
 
 **Drop on queue overflow, not block**
-The alternative to `put_nowait()` + discard in synchronous handlers is blocking the event loop — which would stall all in-flight coroutines including the worker, the HTTP server, and the OPC UA reconnect loop. Queue overflow at 2,500 in-flight messages already indicates a sustained MQTT or worker failure; adding producer backpressure at that point would amplify the failure, not mitigate it.
+The alternative to `put_nowait()` + discard in synchronous handlers is blocking the event loop — which would stall all in-flight coroutines including the worker, the HTTP server, and the OPC UA reconnect loop. Queue overflow at 10,000 in-flight messages already indicates a sustained MQTT or worker failure; adding producer backpressure at that point would amplify the failure, not mitigate it.
 
 **In-memory anomaly state, not persisted**
 Persisting per-sensor sliding windows adds write overhead and recovery complexity for a feature whose value is low-latency online detection, not historical completeness. After restart, detection resumes after `min_samples` new readings. Historical anomaly context already lives in InfluxDB via the raw series. The cold-start window is documented, not hidden.
 
 **MQTT QoS 1, not QoS 2**
-QoS 2 requires a 4-way handshake per message. At ~100 msg/s that is ~400 additional MQTT round-trips per second. The application layer already provides at-least-once semantics via `delete_batch()` post-confirm. InfluxDB deduplicates on `(measurement, tags, timestamp)`, so re-delivery of an identical point is harmless. QoS 2 overhead is real; the benefit is redundant.
+QoS 2 requires a 4-way handshake per message. At ~451 msg/s that is ~1,800 additional MQTT round-trips per second. The application layer already provides at-least-once semantics via `delete_batch()` post-confirm. InfluxDB deduplicates on `(measurement, tags, timestamp)`, so re-delivery of an identical point is harmless. QoS 2 overhead is real; the benefit is redundant.
 
 **No HTTP framework**
 Three read-only JSON endpoints do not justify an ASGI dependency. `asyncio.start_server()` from stdlib answers health checks in microseconds. HTTP/1.0-style connection closing is fine for low-frequency polling; it would be inappropriate for sustained query load, which is not a use case here.
 
 **Scalability limits**
-At current load (~95 msg/s), the architecture has ~66× headroom to the worker MQTT ceiling and ~5× headroom to the SQLite per-message ceiling. The documented stress scenario: 20 AC signals including high-frequency channels (wheel slip, accelerometer, suspension at ~60 Hz effective) under simultaneous MQTT outage yields ~1,200 msg/s ingress, exceeding the SQLite write ceiling. The `BEST_EFFORT` classification for those signals is the designed mitigation. A worker pool, Redis, or partitioned Kafka topic would be the next scaling levers — when the benchmark justifies it.
+At current load (~451 msg/s), the architecture has ~14× headroom to the worker MQTT ceiling and ~5× headroom to the SQLite per-message ceiling. The documented stress scenario: 21 AC signals including high-frequency channels (wheel slip, accelerometer, suspension at ~60 Hz effective) under simultaneous MQTT outage yields ~1,200 msg/s ingress — well within the SQLite batch ceiling (>163,000 msg/s), but persistence volume grows rapidly. The `BEST_EFFORT` classification for those signals is the designed mitigation: it reduces what reaches SQLite before the write path is ever stressed. A worker pool, Redis, or partitioned Kafka topic would be the next scaling levers — when the benchmark justifies it.
+
 
 ---
 
@@ -220,7 +224,7 @@ Tags are indexed; `sensor_id` queries are O(series). Timestamp comes from the so
 | OPC UA disconnection | Exponential backoff 2 s → 60 s via `asyncio.Event` | Subscriptions restored without manual intervention |
 | Data corruption at ingestion | Pydantic validators reject NaN, ±Inf, naive timestamps, `value=None` + `quality≠BAD` | Corrupt readings never enter the queue |
 | Process shutdown | `queue.join()` with 10 s timeout; overflow drained to SQLite | In-flight messages land in SQLite, not lost |
-| SQLite ceiling exceeded (high-freq MQTT outage) | BEST_EFFORT classification reduces persistence volume | No protection beyond QoS classification; documented, not hidden |
+| High-frequency MQTT outage (~1,200 msg/s) | `BEST_EFFORT` classification reduces persistence volume | `CRITICAL` signals persisted; `BEST_EFFORT` discarded by design — SQLite batch ceiling not the constraint at this load |
 
 ---
 
@@ -241,7 +245,7 @@ Tags are indexed; `sensor_id` queries are O(series). Timestamp comes from the so
 | Status | Condition |
 |---|---|
 | `healthy` | MQTT connected + OPC UA connected + queue < 75% of maxsize |
-| `degraded` | queue ≥ 75% full (≥ 1,875 of 2,500) |
+| `degraded` | queue ≥ 75% full (≥ 7,500 of 10,000) |
 | `unhealthy` | MQTT disconnected or OPC UA subscription dropped |
 
 `mqtt_connected` is a cached flag updated by `send()` side effects — no live I/O on the health check path.
@@ -297,35 +301,38 @@ All measurements from local development hardware. Not representative of producti
 
 **Worker throughput** (`benchmark_worker.py`, 10,000 pre-loaded messages):
 
-| Destination | Throughput |
-|---|---|
-| `MockDestination` (pure in-memory, no I/O) | > 31,000 msg/s |
-| `MQTTDestination` (local Docker broker) | > 6,300 msg/s |
+| Destination     | Throughput     | Bottleneck                         |
+|-----------------|----------------|------------------------------------|
+| MockDestination | > 31,000 msg/s | Pure in-memory processing          |
+| MQTTDestination | > 6,300 msg/s  | MQTT protocol + Docker network I/O |
 
 Bottleneck with real MQTT: publish round-trip latency and socket I/O, not Python or asyncio processing. `MockDestination` is fully integrated in the benchmark, enabling CPU and anomaly detector throughput measurement without external infrastructure.
 
 **SQLite write throughput** (`benchmark_sqlite.py`, `save_batch()` in isolation):
 
-| Batch size | Throughput |
-|---|---|
-| 1 (per-message commit, worst case) | ~442 msg/s |
-| 500 | ~156,000 msg/s |
-| 1,000 | ~232,000 msg/s |
+| Mode        | Batch size | Messages | Throughput     | Time    |
+|-------------|------------|----------|----------------|---------|
+| Per-message | 1          | 10,000   | 446.8 msg/s    | 22.38 s |
+| Batch       | 500        | 10,000   | 162,829 msg/s  | 0.061 s |
+| Batch       | 1,000      | 50,000   | 241,049 msg/s  | 0.207 s |
 
 `save_batch()` uses `executemany` within a single transaction (PRAGMA WAL) to amortise commit overhead. The previous ~490 msg/s ceiling was caused by individual per-message transactions saturating disk I/O — transactional batching eliminates that bottleneck. Under real combined load (worker + `forward_pending()` contention on the shared `asyncio.Lock`), throughput will be lower than the isolated figure.
+
 
 **Operational load vs. measured limits:**
 
 | Metric | Value |
 |---|---|
-| Current load (5 OPC UA + 21 AC signals) | ~95 msg/s |
+| OPC UA load (5 sensors, ~1 Hz publish interval) | ~1 msg/s |
+| AC load (21 signals, 50 Hz loop, threshold-filtered) | ~450 msg/s observed |
+| Combined operational load | ~451 msg/s |
 | Worker ceiling (MQTT) | > 6,300 msg/s |
-| SQLite effective ceiling (batch 500) | > 150,000 msg/s |
-| Margin to worker ceiling | ~66× |
-| Margin to SQLite ceiling | > 1,000× |
-| Projected stress scenario (21 AC signals, ~60 Hz effective) | ~1,200 msg/s |
+| SQLite effective ceiling (batch 500) | > 163,000 msg/s |
+| Margin to worker ceiling | ~14× |
+| Margin to SQLite ceiling | ~362× |
+| Worst case: all 21 AC signals fire every tick | ~1,050 msg/s |
 
-At ~1,200 msg/s with MQTT down, SQLite batch throughput has sufficient headroom. The `BEST_EFFORT` QoS classification for high-frequency signals remains the first line of defence — it reduces persistence volume before SQLite is ever stressed.
+The AC adapter runs a 50 Hz evaluation loop but emits only when a signal exceeds its configured delta threshold — `fuel` and `gear` emit rarely; `acc_g_*`, `wheel_slip_*`, and `suspension_*` emit near-continuously under dynamic conditions. Observed throughput of ~450 msg/s reflects normal circuit running; short bursts during heavy braking or ABS modulation push emission higher. At worst-case throughput (1,050 msg/s) with MQTT down, SQLite batch headroom remains sufficient. The `BEST_EFFORT` QoS classification for high-frequency AC signals is the first line of defence — it reduces persistence volume before SQLite is ever stressed.
 
 ---
 
@@ -345,6 +352,35 @@ Tyre temps, wheel slip, accelerometers, suspension, and fuel (16 of 21 AC signal
 **No authentication in the demo stack.** Mosquitto, InfluxDB, and the OPC UA simulator are configured without TLS or token auth for local development ease. Not suitable for network-exposed deployments.
 
 **Single-node architecture.** One worker, one SQLite file, one MQTT connection. Horizontal scaling would require partitioning the queue, sharding SQLite or replacing it, and coordinating worker state — none of which is warranted at current load.
+
+---
+
+## Demos
+
+### Industrial Dashboard (OPC UA)
+
+<video src="docs/assets/dashboard_opcua.mp4" width="900" autoplay loop muted playsinline></video>
+
+Grafana dashboard showing 5 OPC UA signals in real time: temperature, pressure, vibration, flow and humidity. The grey band represents mean ± k·σ from the anomaly detector's sliding window. Red bars are alerts published to `gateway/alerts` on consecutive threshold exceedances. The final sequence shows a sensor transitioning to BAD quality state and the gateway detecting it automatically.
+
+### Motorsport Dashboard (Assetto Corsa)
+<video src="docs/assets/dashboard_ac.mp4" width="1000" autoplay loop muted playsinline></video>
+
+Grafana dashboard showing 21 telemetry signals from a Porsche 911 GT3 RS (991 gen) at Spa-Francorchamps: RPM, throttle, brake, speed, gear and steering among others. CRITICAL signals (RPM, brake, throttle, gear, speed) are persisted to SQLite during broker outages and recovered automatically on reconnection.
+
+### Live Failover — MQTT Broker
+<div align="center">
+<video src="docs/assets/failover_broker.mp4" width="600" autoplay loop muted playsinline></video>
+</div>
+
+26-second broker outage triggered by `test_broker_failover.sh`. During the outage `status` switches to `unhealthy`, `queue` grows as messages buffer in memory and `pending` accumulates in SQLite. On reconnection the broker drains to `queue=0`, `pending=0` and `status` returns to `healthy` in 1s. Full cycle visible in a single run.
+
+### Live Failover — OPC UA
+<div align="center">
+<video src="docs/assets/failover_opcua.mp4" width="600" autoplay loop muted playsinline></video>
+</div>
+
+46-second OPC UA simulator outage triggered by `test_opcua_failover.sh`. `opcua=false` during the entire outage while MQTT remains healthy. Recovery via exponential backoff — `opcua=true` restored automatically in 11s without manual intervention. Final state shows all signals healthy and queue drained.
 
 ---
 
@@ -408,7 +444,7 @@ python -m tests.benchmark_worker
 
 **No I/O on the health check path.** `is_available()` returns a cached flag; `opc_ua_connected` reads an `asyncio.Event`. Health endpoints answer in microseconds without network calls.
 
-**Scale when the benchmark says to.** Single worker, single SQLite file, one MQTT connection. Current load is ~95 msg/s against a worker ceiling of >6,300 msg/s and a SQLite batch ceiling of >150,000 msg/s. The benchmark that would justify a pool, Redis, or Kafka does not yet exist.
+**Scale when the benchmark says to.** Single worker, single SQLite file, one MQTT connection. Current load is ~451 msg/s against a worker ceiling of >6,300 msg/s and a SQLite batch ceiling of >163,000 msg/s. The benchmark that would justify a pool, Redis, or Kafka does not yet exist.
 
 ---
 
@@ -436,10 +472,13 @@ python -m tests.benchmark_worker
 │   ├── ac_signals.yaml          # AC signal → sensor_id, unit, range, criticality
 │   └── analysis.yaml            # Anomaly detector: window_size, k_factor, min_samples
 ├── simulator/
-│   └── opcua_server.py          # Containerised OPC UA server with simulated sensor data
+│   ├── opcua_server.py          # Containerised OPC UA server with simulated sensor data
+│   └── ac_sim.py                # Assetto Corsa UDP telemetry simulator: spectrally rich deterministic physics (Spa-Francorchamps), delta-threshold emission at 50 Hz, scheduled fault injection (STUCK, SPIKE, NOISE, DROPOUT, FLATTY, OFFSET)
 ├── tests/
 │   ├── test_models.py           # Unit tests: SensorReading validators (14 cases)
 │   ├── test_pipeline.py         # Integration tests: end-to-end pipeline (9 cases)
+│   ├── test_broker_failover.sh  # E2E failover test: stops/restarts Mosquitto, polls /health and /metrics until queue drains and status returns healthy
+│   ├── test_opcua_failover.sh   # E2E failover test: stops/restarts OPC UA simulator, polls /health until opc_ua_connected and status return healthy
 │   ├── benchmark_worker.py      # Worker throughput benchmark
 │   └── benchmark_sqlite.py      # SQLite write throughput benchmark
 ├── docker-compose.yml
@@ -456,13 +495,6 @@ python -m tests.benchmark_worker
 
 ## Portfolio Notes
 
-### Demo
-
-<!-- Add GIF or screen recording of the running pipeline here -->
-<!-- Suggested: terminal split showing gateway logs + curl /metrics cycling -->
-<!-- Grafana dashboard screenshot showing live sensor_readings series -->
-
-> Video walkthrough: *(link to be added)* — covers architecture, failure injection (MQTT kill + recovery), and anomaly alert triggering.
 
 ### Why This Project Matters
 

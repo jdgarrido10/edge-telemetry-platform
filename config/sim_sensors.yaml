@@ -1,74 +1,79 @@
 sensores:
+
   - sensor_id: planta1.maquina1.temperatura
     tipo: temperatura
     sim:
-      base: 65.0           # Valor central de operación normal [ºC]
-      drift_rate: 0.003    # Deriva térmica lenta [ºC/s]. Positivo = calentamiento
-      drift_limit: 5.0     # Máximo desvío acumulable por deriva [ºC]. Evita runaway
-      noise_sigma: 0.15    # Ruido gaussiano del sensor [ºC]. Termopar limpio
-      op_min: 55.0         # Límite operacional inferior [ºC]
-      op_max: 75.0         # Límite operacional superior [ºC]
+      base: 65.0
+      drift_rate: 0.003
+      drift_limit: 5.0
+      noise_sigma: 0.15
+      op_min: 55.0
+      op_max: 75.0
+
   - sensor_id: planta1.maquina1.presion
     tipo: presion
     sim:
-      base: 4.5            # Presión media de proceso [bar]
-      amplitude: 0.4       # Amplitud del ciclo de compresor [bar]
-      period: 180.0        # Período del ciclo de compresor [s]
-      rise_fraction: 0.25  # Fracción del período que dura la subida (0.25 = subida rápida)
-      noise_sigma: 0.04    # Ruido de manómetro industrial. Muy bajo
+      base: 4.5
+      amplitude: 0.4
+      period: 180.0
+      rise_fraction: 0.25
+      noise_sigma: 0.04
       op_min: 3.5
       op_max: 5.5
+
   - sensor_id: planta1.maquina1.vibracion
     tipo: vibracion
     sim:
-      base: 0.45           # Nivel de vibración normal [mm/s]
-      noise_sigma: 0.03    # Ruido base del acelerómetro [mm/s]
+      base: 0.45
+      noise_sigma: 0.03
       op_min: 0.0
       op_max: 2.0
-      # Anomalía inyectable: simula fallo incipiente de rodamiento
       fault:
-        enabled: true         # true = inyectar anomalía ahora mismo
-        start_offset_s: 10   # Segundos desde arranque hasta inicio de anomalía
-        duration_s: 120         # Duración de la ventana de fallo [s]
-        harmonic_amplitude: 0.35  # Amplitud del armónico de fallo [mm/s]
-        harmonic_period: 12.0     # Período del armónico de fallo [s]
+        enabled: true
+        start_offset_s: 15
+        duration_s: 30
+        harmonic_amplitude: 0.60
+        harmonic_period: 12.0
 
   - sensor_id: planta1.maquina2.temperatura
     tipo: temperatura
     sim:
       base: 80.0
-      drift_rate: 0.005    # Deriva más rápida: motor más caliente
+      drift_rate: 0.005
       drift_limit: 8.0
-      noise_sigma: 0.4     # Sensor más ruidoso (termopar de menor calidad)
+      noise_sigma: 0.4
       op_min: 70.0
       op_max: 92.0
-      # Degradación gradual de sensor
       degradation:
         enabled: false
-        start_offset_s: 180    # Segundos hasta que empieza a degradarse
-        noise_growth_rate: 0.002  # sigma aumenta este valor por segundo
-        drift_growth_rate: 0.001  # drift_rate aumenta este valor por segundo
+        start_offset_s: 180
+        noise_growth_rate: 0.002
+        drift_growth_rate: 0.001
+
   - sensor_id: planta1.maquina2.velocidad
     tipo: velocidad_discreta
     sim:
-      niveles: [800.0, 1200.0, 1600.0, 2000.0]  # Regímenes válidos [rpm]
-      nivel_inicial: 1       # Índice del nivel de arranque
-      prob_cambio: 0.04      # Probabilidad de cambio de régimen por ciclo
-      noise_sigma: 5.0       # Ruido del encoder/tacómetro [rpm]
+      niveles: [800.0, 1200.0, 1600.0, 2000.0]
+      nivel_inicial: 1
+      prob_cambio: 0.04
+      noise_sigma: 5.0
       op_min: 700.0
       op_max: 2100.0
 
-# ─── Ventanas de calidad BAD programables ────────────────────────────────────
-# Permite simular un sensor desconectado, en mantenimiento o con fallo de comm.
-# Independiente de los parámetros físicos de cada sensor.
-# El gateway debe recibir StatusCode=Bad durante toda la ventana.
+# ─── Ventanas de calidad BAD programables ─────────────────────────────────────
 fault_windows:
+
   - sensor_id: planta1.maquina1.presion
-    start_offset_s: 60      # Empieza a los 60 s desde arranque del simulador
-    duration_s: 30          # Durante 30 s → Bad
+    start_offset_s: 20
+    duration_s: 15
     reason: "mantenimiento_valvula"
 
   - sensor_id: planta1.maquina2.temperatura
-    start_offset_s: 240
-    duration_s: 45
+    start_offset_s: 50
+    duration_s: 20
     reason: "perdida_comunicacion"
+
+  - sensor_id: planta1.maquina1.vibracion
+    start_offset_s: 60
+    duration_s: 15
+    reason: "fallo_comunicacion"

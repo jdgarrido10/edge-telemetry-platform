@@ -42,6 +42,7 @@ services:
     environment:
       - GF_SECURITY_ADMIN_USER=${GRAFANA_USER}
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+      - GF_DASHBOARDS_MIN_REFRESH_INTERVAL=1s
     depends_on:
       - influxdb
     volumes:

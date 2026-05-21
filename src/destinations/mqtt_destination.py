@@ -45,7 +45,7 @@ class MQTTDestination(BaseDestination):
         # TODO: devolver True/False según resultado
         try:
             str_payload = json.dumps(payload)
-            await self.client.publish(self.topic, str_payload)
+            await self.client.publish(self.topic, str_payload, qos=1)
             self._connected = True
             return True
         except aiomqtt.MqttError:
